@@ -1,0 +1,178 @@
+# Build the repository and an unsigned Desktop DMG for macOS on Intel (x86_64).
+#
+# The local equivalent is scripts/build-macos-x64.sh.
+#
+# Runner note: pnpm v11 ships no darwin-x64 standalone binary, so this workflow
+# keeps pnpm/action-setup on the v5 npm-install line instead of the self-update
+# path used on other platforms (see .github/workflows/node-addon-system.yml).
+name: Build macOS x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Create or update the unsigned macOS x64 prerelease for this version'
+        type: boolean
+        default: false
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/build-macos-x64.yml'
+      - 'scripts/build-macos-x64.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+  NODE_OPTIONS: --dns-result-order=ipv4first
+  # The packaging downloader uses one fetch per asset; give a slow runner room
+  # when the prefetch step has not already populated the cache.
+  DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS: '600000'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: macOS x64 (Intel)
+    # Release publication is opt-in for the manual run; the build itself stays read-only.
+    permissions:
+      contents: write
+    # macos-15-intel is GitHub's hosted Intel runner. Point MACOS_X64_RUNNER at a
+    # self-hosted Intel macOS runner when the hosted label is unavailable.
+    runs-on: ${{ vars.MACOS_X64_RUNNER || 'macos-15-intel' }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.28.5
+        uses: pnpm/action-setup@v5.0.0
+        with:
+          version: 11.28.5
+          package_json_file: package.json
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Show the build host
+        run: |
+          uname -a
+          node --version
+          pnpm --version
+          xcodebuild -version
+          df -h /
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build repository artifacts
+        env:
+          # The Intel runner has four cores; keep the gate scheduler inside that budget.
+          DSH_GATE_CONCURRENCY: '4'
+          DSH_GATE_FAIL_FAST: '1'
+        run: pnpm run build
+
+      - name: Smoke-test the built CLI
+        run: pnpm dsh --version
+
+      - name: Pre-fetch the Desktop runtime payload
+        run: node scripts/prefetch-macos-x64-runtime.mjs
+
+      - name: Package the unsigned macOS x64 Desktop app
+        run: |
+          # A transient download failure in prepare:runtime is retried once; the
+          # prefetch step makes that retry cheap by reusing verified archives.
+          for attempt in 1 2; do
+            echo "Packaging attempt $attempt..."
+            if pnpm run package:desktop:mac:x64:unsigned; then
+              exit 0
+            fi
+            echo "::warning::Packaging attempt $attempt failed."
+            if [ "$attempt" -eq 2 ]; then
+              exit 1
+            fi
+            rm -rf apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts
+            sleep 15
+          done
+
+      - name: Record artifact checksums
+        run: |
+          artifacts=apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts
+          ls -lh "$artifacts"
+          (cd "$artifacts" && shasum -a 256 *.dmg > SHA256SUMS && cat SHA256SUMS)
+          {
+            echo '### macOS x64 unsigned Desktop artifacts'
+            echo
+            echo '```'
+            ls -lh "$artifacts"
+            cat "$artifacts/SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the unsigned Desktop artifacts
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: deepseek-harness-macos-x64-unsigned
+          path: |
+            apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/*.dmg
+            apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish the unsigned build as a prerelease
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="macos-x64-unsigned-v${version}"
+          artifacts=apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            printf 'Unsigned macOS x64 build of DeepSeek Harness %s.\n\n' "$version"
+            printf -- '- Architecture: x86_64 (Intel)\n'
+            printf -- '- Bundled runtime: Node 24.21.0, Python 3.12.14, pnpm 11.28.5\n'
+            printf -- '- Ad-hoc signed only and not notarized. On first launch, right-click the app and choose Open, or run:\n'
+            printf '  `xattr -dr com.apple.quarantine <path-to-dmg>`\n'
+          } > "$notes"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Updating existing release $tag"
+          else
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "DeepSeek Harness ${version} · macOS x64 (unsigned)" \
+              --prerelease \
+              --latest=false \
+              --notes-file "$notes"
+          fi
+          gh release upload "$tag" "$artifacts"/*.dmg "$artifacts"/SHA256SUMS --clobber
+          {
+            echo '### Unsigned macOS x64 prerelease'
+            echo
+            gh release view "$tag" --json url --jq '.url'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload packaging diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: macos-x64-packaging-logs
+          path: |
+            apps/desktop/.desktop-build/packaging-runs/**
+          if-no-files-found: warn
+          retention-days: 7
