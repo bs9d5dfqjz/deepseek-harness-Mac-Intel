@@ -13,6 +13,13 @@ import { createPluginProfile } from '../src/project-manager.ts'
 import type { DesktopRuntimeDescriptor } from '../src/runtime-tree.ts'
 
 /**
+ * The first LibreOffice conversion in a cold smoke home builds a font cache.
+ * Hosted Intel runners can exceed the provider's 60-second production default,
+ * so the correctness smoke gets a wider budget rather than reporting a timeout.
+ */
+const OFFICE_SMOKE_TIMEOUT_MS = 300_000
+
+/**
  * Check CLI package operations, Host startup, its frontend, external plugins and real Office-to-PDF conversion.
  * @param root - Materialized dsh resources.
  * @param node - Prepared target Electron executable.
@@ -108,10 +115,11 @@ export function apply(ctx) {
         const json = skill?.content.match(/\\n(\\{\\n[\\s\\S]+)$/u)?.[1]
         if (json === undefined) throw new Error('Office skill did not supply CLI paths')
         const { libreofficeKit: { node, cli } } = JSON.parse(json)
-        const options = { cwd: ${JSON.stringify(home)}, env: { ...process.env, PATH: '' }, timeout: 120_000 }
+        const options = { cwd: ${JSON.stringify(home)}, env: { ...process.env, PATH: '' }, timeout: ${OFFICE_SMOKE_TIMEOUT_MS} }
         const capabilities = await promisify(execFile)(node, [cli, 'capabilities'], options)
         const output = ${JSON.stringify(join(home, 'cli.pdf'))}
-        await promisify(execFile)(node, [cli, 'convert', '--input', ${JSON.stringify(join(home, 'input.docx'))}, '--output', output], options)
+        await promisify(execFile)(node, [cli, 'convert', '--input', ${JSON.stringify(join(home, 'input.docx'))}, '--output', output,
+          '--timeout-ms', '${OFFICE_SMOKE_TIMEOUT_MS}'], options)
         response.end(JSON.stringify({ capabilities: JSON.parse(capabilities.stdout), pdf: (await readFile(output)).toString('base64') }))
       } catch (error) {
         response.statusCode = 500
@@ -144,7 +152,18 @@ export function apply(ctx) {
     manifest.dependencies = { ...manifest.dependencies, [pluginName]: `file:${plugin}` }
     manifest.dsh.profile.bundles.push(pluginName)
     writeFileSync(join(profile, 'package.json'), JSON.stringify(manifest))
-    writeFileSync(join(profile, 'cordis.patch.yml'), '- id: webserver\n  config:\n    host: 127.0.0.1\n    port: 0\n')
+    // A row patch replaces the row's whole config; the bundle sets none for
+    // office-to-pdf, so the remaining fields keep their schema defaults.
+    writeFileSync(join(profile, 'cordis.patch.yml'), [
+      '- id: webserver',
+      '  config:',
+      '    host: 127.0.0.1',
+      '    port: 0',
+      '- id: office-to-pdf',
+      '  config:',
+      `    timeoutMs: ${OFFICE_SMOKE_TIMEOUT_MS}`,
+      '',
+    ].join('\n'))
     const ready = await Promise.race([host.start(), new Promise<never>((_, reject) => {
       timer = setTimeout(() => { reject(new Error('desktop runtime: Host readiness exceeded 120 seconds')) }, 120_000)
     })])
